@@ -10,6 +10,7 @@ import (
 	_ "github.com/EvolutionAPI/evolution-go/docs"
 	call_handler "github.com/EvolutionAPI/evolution-go/pkg/call/handler"
 	chat_handler "github.com/EvolutionAPI/evolution-go/pkg/chat/handler"
+	chathistory_handler "github.com/EvolutionAPI/evolution-go/pkg/chathistory/handler"
 	community_handler "github.com/EvolutionAPI/evolution-go/pkg/community/handler"
 	group_handler "github.com/EvolutionAPI/evolution-go/pkg/group/handler"
 	instance_handler "github.com/EvolutionAPI/evolution-go/pkg/instance/handler"
@@ -38,6 +39,7 @@ type Routes struct {
 	newsletterHandler       newsletter_handler.NewsletterHandler
 	pollHandler             *poll_handler.PollHandler
 	serverHandler           server_handler.ServerHandler
+	chatHistoryHandler      chathistory_handler.ChatHistoryHandler
 }
 
 func (r *Routes) AssignRoutes(eng *gin.Engine) {
@@ -168,6 +170,9 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/mute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatMute)           // TODO: not working
 			routes.POST("/unmute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnmute)       // TODO: not working
 			routes.POST("/history-sync", r.chatHandler.HistorySyncRequest)
+			routes.GET("/contacts", r.chatHistoryHandler.ListContacts)
+			routes.GET("/messages", r.chatHistoryHandler.ListMessages)
+			routes.GET("/import", r.chatHistoryHandler.Import)
 		}
 	}
 	routes = eng.Group("/group")
@@ -259,6 +264,7 @@ func NewRouter(
 	newsletterHandler newsletter_handler.NewsletterHandler,
 	pollHandler *poll_handler.PollHandler,
 	serverHandler server_handler.ServerHandler,
+	chatHistoryHandler chathistory_handler.ChatHistoryHandler,
 ) *Routes {
 	return &Routes{
 		authMiddleware:          authMiddleware,
@@ -275,5 +281,6 @@ func NewRouter(
 		newsletterHandler:       newsletterHandler,
 		pollHandler:             pollHandler,
 		serverHandler:           serverHandler,
+		chatHistoryHandler:      chatHistoryHandler,
 	}
 }

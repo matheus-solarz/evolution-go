@@ -25,6 +25,10 @@ import (
 	call_service "github.com/EvolutionAPI/evolution-go/pkg/call/service"
 	chat_handler "github.com/EvolutionAPI/evolution-go/pkg/chat/handler"
 	chat_service "github.com/EvolutionAPI/evolution-go/pkg/chat/service"
+	chathistory_handler "github.com/EvolutionAPI/evolution-go/pkg/chathistory/handler"
+	chathistory_model "github.com/EvolutionAPI/evolution-go/pkg/chathistory/model"
+	chathistory_repository "github.com/EvolutionAPI/evolution-go/pkg/chathistory/repository"
+	chathistory_service "github.com/EvolutionAPI/evolution-go/pkg/chathistory/service"
 	community_handler "github.com/EvolutionAPI/evolution-go/pkg/community/handler"
 	community_service "github.com/EvolutionAPI/evolution-go/pkg/community/service"
 	config "github.com/EvolutionAPI/evolution-go/pkg/config"
@@ -160,6 +164,8 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	instanceRepository := instance_repository.NewInstanceRepository(db)
 	messageRepository := message_repository.NewMessageRepository(db)
 	labelRepository := label_repository.NewLabelRepository(db)
+	chatHistoryRepository := chathistory_repository.NewChatHistoryRepository(db)
+	chatHistoryService := chathistory_service.NewChatHistoryService(chatHistoryRepository, loggerWrapper)
 
 	whatsmeowService := whatsmeow_service.NewWhatsmeowService(
 		instanceRepository,
@@ -177,6 +183,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 		mediaStorage,
 		natsProducer,
 		loggerWrapper,
+		chatHistoryService,
 	)
 	instanceService := instance_service.NewInstanceService(
 		instanceRepository,
@@ -185,8 +192,9 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 		whatsmeowService,
 		config,
 		loggerWrapper,
+		chatHistoryService,
 	)
-	sendMessageService := send_service.NewSendService(clientPointer, whatsmeowService, config, loggerWrapper)
+	sendMessageService := send_service.NewSendService(clientPointer, whatsmeowService, config, loggerWrapper, chatHistoryService)
 	userService := user_service.NewUserService(clientPointer, whatsmeowService, loggerWrapper)
 	messageService := message_service.NewMessageService(clientPointer, messageRepository, whatsmeowService, loggerWrapper)
 	chatService := chat_service.NewChatService(clientPointer, whatsmeowService, loggerWrapper)
@@ -198,6 +206,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 
 	// NOVO: PollHandler usando PollService já inicializado no whatsmeowService (evita dupla inicialização)
 	pollHandler := poll_handler.NewPollHandler(whatsmeowService.GetPollService(), loggerWrapper)
+	chatHistoryHandler := chathistory_handler.NewChatHistoryHandler(chatHistoryService)
 
 	r := gin.Default()
 
@@ -234,6 +243,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 		newsletter_handler.NewNewsletterHandler(newsletterService),
 		pollHandler,
 		server_handler.NewServerHandler(),
+		chatHistoryHandler,
 	).AssignRoutes(r)
 
 	if config.ConnectOnStartup {
@@ -257,7 +267,13 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 }
 
 func migrate(db *gorm.DB) {
-	err := db.AutoMigrate(&instance_model.Instance{}, &message_model.Message{}, &label_model.Label{})
+	err := db.AutoMigrate(
+		&instance_model.Instance{},
+		&message_model.Message{},
+		&label_model.Label{},
+		&chathistory_model.ChatMessage{},
+		&chathistory_model.ChatContact{},
+	)
 
 	if err != nil {
 		log.Fatal(err)

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	chathistory_service "github.com/EvolutionAPI/evolution-go/pkg/chathistory/service"
 	config "github.com/EvolutionAPI/evolution-go/pkg/config"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	logger_wrapper "github.com/EvolutionAPI/evolution-go/pkg/logger"
@@ -51,10 +52,18 @@ type SendService interface {
 }
 
 type sendService struct {
-	clientPointer    map[string]*whatsmeow.Client
-	whatsmeowService whatsmeow_service.WhatsmeowService
-	config           *config.Config
-	loggerWrapper    *logger_wrapper.LoggerManager
+	clientPointer      map[string]*whatsmeow.Client
+	whatsmeowService   whatsmeow_service.WhatsmeowService
+	config             *config.Config
+	loggerWrapper      *logger_wrapper.LoggerManager
+	chatHistoryService chathistory_service.ChatHistoryService
+}
+
+func (s *sendService) recordOutgoing(instance *instance_model.Instance, msg *MessageSendStruct) {
+	if !s.config.DatabaseSaveMessages || s.chatHistoryService == nil || msg == nil {
+		return
+	}
+	go s.chatHistoryService.RecordOutgoing(instance.Id, msg.Info, msg.Message)
 }
 
 type SendDataStruct struct {
@@ -1765,6 +1774,7 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 		},
 	}
 
+	s.recordOutgoing(instance, messageSent)
 	return messageSent, nil
 }
 
@@ -2352,6 +2362,7 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 	}
 
 	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Message sent to %s", instance.Id, data.Number)
+	s.recordOutgoing(instance, messageSent)
 	return messageSent, nil
 }
 
@@ -2654,6 +2665,7 @@ func (s *sendService) SendStatusText(data *StatusTextStruct, instance *instance_
 
 	s.sendStatusWebhook(messageSent, instance, "text")
 	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Status text sent successfully", instance.Id)
+	s.recordOutgoing(instance, messageSent)
 	return messageSent, nil
 }
 
@@ -2804,6 +2816,7 @@ func (s *sendService) sendStatusMedia(client *whatsmeow.Client, data *StatusMedi
 	}
 
 	s.sendStatusWebhook(messageSent, instance, "media")
+	s.recordOutgoing(instance, messageSent)
 	return messageSent, nil
 }
 
@@ -2846,11 +2859,13 @@ func NewSendService(
 	whatsmeowService whatsmeow_service.WhatsmeowService,
 	config *config.Config,
 	loggerWrapper *logger_wrapper.LoggerManager,
+	chatHistoryService chathistory_service.ChatHistoryService,
 ) SendService {
 	return &sendService{
-		clientPointer:    clientPointer,
-		whatsmeowService: whatsmeowService,
-		config:           config,
-		loggerWrapper:    loggerWrapper,
+		clientPointer:      clientPointer,
+		whatsmeowService:   whatsmeowService,
+		config:             config,
+		loggerWrapper:      loggerWrapper,
+		chatHistoryService: chatHistoryService,
 	}
 }

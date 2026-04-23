@@ -34,6 +34,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	chathistory_service "github.com/EvolutionAPI/evolution-go/pkg/chathistory/service"
 	"github.com/EvolutionAPI/evolution-go/pkg/config"
 	producer_interfaces "github.com/EvolutionAPI/evolution-go/pkg/events/interfaces"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
@@ -89,6 +90,7 @@ type whatsmeowService struct {
 	processedMessages  *cache.Cache
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
+	chatHistoryService chathistory_service.ChatHistoryService
 }
 
 type MyClient struct {
@@ -120,6 +122,7 @@ type MyClient struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
+	chatHistoryService chathistory_service.ChatHistoryService
 }
 
 type ClientData struct {
@@ -471,6 +474,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		natsProducer:       w.natsProducer,
 		loggerWrapper:      w.loggerWrapper,
 		qrcodeCount:        0,
+		chatHistoryService: w.chatHistoryService,
 	}
 
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
@@ -1118,6 +1122,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 
+		if mycli.config.DatabaseSaveMessages && mycli.chatHistoryService != nil {
+			go mycli.chatHistoryService.RecordRealtime(mycli.userID, evt)
+		}
+
 		// Auto-marca mensagens como lidas se configurado
 		if mycli.Instance.ReadMessages && !evt.Info.IsFromMe {
 			go func() {
@@ -1707,6 +1715,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "HistorySync"
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] History sync event received %+v", mycli.userID, evt.Data.SyncType)
+
+		if mycli.config.DatabaseSaveMessages && mycli.chatHistoryService != nil {
+			go func(ev *events.HistorySync) {
+				mycli.chatHistoryService.RecordHistorySync(mycli.userID, ev)
+				mycli.runContactEnrichment()
+			}(evt)
+		}
 	case *events.AppState:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] App state event received %+v", mycli.userID, evt)
 	case *events.LoggedOut:
@@ -1828,6 +1843,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.OfflineSyncCompleted:
 		doWebhook = true
 		postMap["event"] = "OfflineSyncCompleted"
+		if mycli.config.DatabaseSaveMessages && mycli.chatHistoryService != nil {
+			go mycli.runContactEnrichment()
+		}
 	case *events.ConnectFailure:
 		doWebhook = true
 		postMap["event"] = "ConnectFailure"
@@ -2662,6 +2680,7 @@ func NewWhatsmeowService(
 	mediaStorage storage_interfaces.MediaStorage,
 	natsProducer producer_interfaces.Producer,
 	loggerWrapper *logger_wrapper.LoggerManager,
+	chatHistoryService chathistory_service.ChatHistoryService,
 ) WhatsmeowService {
 	// Inicializar PollService de forma segura
 	pollSvc := poll_service.NewPollService(authDB, loggerWrapper)
@@ -2686,12 +2705,132 @@ func NewWhatsmeowService(
 		processedMessages:  cache.New(30*time.Minute, 1*time.Hour),
 		natsProducer:       natsProducer,
 		loggerWrapper:      loggerWrapper,
+		chatHistoryService: chatHistoryService,
 	}
 }
 
 // GetPollService retorna o serviço de polls (evita dupla inicialização)
 func (w *whatsmeowService) GetPollService() poll_service.PollService {
 	return w.pollService
+}
+
+// runContactEnrichment mirrors the whatsmeow address-book into chat_contacts as an
+// UPDATE-only enrichment — never creates rows. Safe to call repeatedly; idempotent.
+//
+// Two passes:
+//   1. Address-book pass: copy names directly for any contact whose JID matches a whatsmeow
+//      address-book entry (covers @s.whatsapp.net contacts).
+//   2. LID pass: for every @lid contact still without a name, resolve LID→phone via
+//      whatsmeow's built-in mapping store, then borrow the name from the phone equivalent.
+func (mycli *MyClient) runContactEnrichment() {
+	if mycli.chatHistoryService == nil || mycli.WAClient == nil {
+		return
+	}
+	ctx := context.Background()
+
+	contacts, err := mycli.WAClient.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] enrich names: GetAllContacts failed: %v", mycli.userID, err)
+		return
+	}
+	patches := make(map[string]chathistory_service.ContactNamePatch, len(contacts))
+	for jid, info := range contacts {
+		patches[jid.String()] = chathistory_service.ContactNamePatch{
+			PushName:     info.PushName,
+			FullName:     info.FullName,
+			BusinessName: info.BusinessName,
+		}
+	}
+	if err := mycli.chatHistoryService.EnrichContactNames(mycli.userID, patches); err != nil {
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] enrich names: %v", mycli.userID, err)
+		return
+	}
+	mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] enrich names: %d address-book entries patched", mycli.userID, len(patches))
+
+	// LID pass — borrow names from the phone equivalent.
+	lidJIDs, err := mycli.chatHistoryService.ListLIDContactsWithoutName(mycli.userID)
+	if err != nil {
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] enrich LID: list failed: %v", mycli.userID, err)
+		return
+	}
+	if len(lidJIDs) == 0 {
+		return
+	}
+
+	lidPatches := make(map[string]chathistory_service.ContactNamePatch, len(lidJIDs))
+	resolved := 0
+	for _, raw := range lidJIDs {
+		lidJID, err := types.ParseJID(raw)
+		if err != nil {
+			continue
+		}
+		pnJID, err := mycli.WAClient.Store.LIDs.GetPNForLID(ctx, lidJID)
+		if err != nil || pnJID.IsEmpty() {
+			continue
+		}
+		patch, ok := patches[pnJID.String()]
+		if !ok || (patch.PushName == "" && patch.FullName == "" && patch.BusinessName == "") {
+			continue
+		}
+		lidPatches[raw] = patch
+		resolved++
+	}
+
+	if resolved == 0 {
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] enrich LID: %d candidates, none resolvable", mycli.userID, len(lidJIDs))
+	} else if err := mycli.chatHistoryService.EnrichContactNames(mycli.userID, lidPatches); err != nil {
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] enrich LID: %v", mycli.userID, err)
+	} else {
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] enrich LID: %d/%d resolved via phone mapping", mycli.userID, resolved, len(lidJIDs))
+	}
+
+	go mycli.runPictureRefresh()
+}
+
+// runPictureRefresh fetches profile pictures for the most recent contacts that don't yet
+// have one cached (or whose cache is older than the TTL). Bounded to a small batch per
+// invocation to avoid hammering WhatsApp; uncached contacts trickle in over reconnects.
+func (mycli *MyClient) runPictureRefresh() {
+	if mycli.chatHistoryService == nil || mycli.WAClient == nil {
+		return
+	}
+	const (
+		batchSize = 100
+		maxAge    = 7 * 24 * time.Hour
+		perCall   = 60 * time.Millisecond // courtesy delay
+	)
+	ctx := context.Background()
+
+	jids, err := mycli.chatHistoryService.ListContactsNeedingPicture(mycli.userID, batchSize, maxAge)
+	if err != nil {
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] picture refresh: list failed: %v", mycli.userID, err)
+		return
+	}
+	if len(jids) == 0 {
+		return
+	}
+
+	fetched, withURL := 0, 0
+	for _, raw := range jids {
+		jid, err := types.ParseJID(raw)
+		if err != nil {
+			continue
+		}
+		info, err := mycli.WAClient.GetProfilePictureInfo(ctx, jid, nil)
+		url := ""
+		if err == nil && info != nil {
+			url = info.URL
+		}
+		if err := mycli.chatHistoryService.MarkPictureFetched(mycli.userID, raw, url); err != nil {
+			continue
+		}
+		fetched++
+		if url != "" {
+			withURL++
+		}
+		time.Sleep(perCall)
+	}
+	mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] picture refresh: %d processed, %d with URL", mycli.userID, fetched, withURL)
 }
 
 // cleanSenderID remove a parte ":numero" do sender ID para exibir apenas o remoteJid correto

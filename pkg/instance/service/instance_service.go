@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	chathistory_service "github.com/EvolutionAPI/evolution-go/pkg/chathistory/service"
 	"github.com/EvolutionAPI/evolution-go/pkg/config"
 	instance_model "github.com/EvolutionAPI/evolution-go/pkg/instance/model"
 	instance_repository "github.com/EvolutionAPI/evolution-go/pkg/instance/repository"
@@ -53,6 +54,7 @@ type instances struct {
 	clientPointer      map[string]*whatsmeow.Client
 	whatsmeowService   whatsmeow_service.WhatsmeowService
 	loggerWrapper      *logger_wrapper.LoggerManager
+	chatHistoryService chathistory_service.ChatHistoryService
 }
 
 type ProxyConfig struct {
@@ -547,6 +549,15 @@ func (i instances) Delete(id string) error {
 		return err
 	}
 
+	if i.chatHistoryService != nil {
+		msgs, contacts, err := i.chatHistoryService.PurgeInstanceData(id)
+		if err != nil {
+			i.loggerWrapper.GetLogger(id).LogWarn("[%s] Failed to purge chat history data: %v", id, err)
+		} else {
+			i.loggerWrapper.GetLogger(id).LogInfo("[%s] Purged chat history: %d messages, %d contacts", id, msgs, contacts)
+		}
+	}
+
 	return nil
 }
 
@@ -852,6 +863,7 @@ func NewInstanceService(
 	whatsmeowService whatsmeow_service.WhatsmeowService,
 	config *config.Config,
 	loggerWrapper *logger_wrapper.LoggerManager,
+	chatHistoryService chathistory_service.ChatHistoryService,
 ) InstanceService {
 	return &instances{
 		instanceRepository: instanceRepository,
@@ -860,5 +872,6 @@ func NewInstanceService(
 		whatsmeowService:   whatsmeowService,
 		config:             config,
 		loggerWrapper:      loggerWrapper,
+		chatHistoryService: chatHistoryService,
 	}
 }
